@@ -739,7 +739,6 @@ async def entrypoint(ctx: JobContext):
         turn_detection="stt",
         min_endpointing_delay=float(delay_setting),  # 0.05s — optimized for low latency
         allow_interruptions=True,
-        before_tts_cb=before_tts_cb,  # First-sentence chunking for faster audio start
     )
 
     await session.start(room=ctx.room, agent=agent, room_input_options=room_input)
