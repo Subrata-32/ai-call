@@ -208,7 +208,10 @@ class AgentTools(llm.ToolContext):
 
     # ── Tool: Transfer to Human ───────────────────────────────────────────
     @llm.function_tool(description="Transfer this call to a human agent. Use if: caller asks for human, is angry, or query is outside scope.")
-    async def transfer_call(self) -> str:
+    async def transfer_call(
+    self,
+    reason: Annotated[str, "Reason for transfer"] = "human_requested",
+    ) -> str:
         logger.info("[TOOL] transfer_call triggered")
         destination = os.getenv("DEFAULT_TRANSFER_NUMBER", "").strip()
         if not destination:
@@ -250,7 +253,10 @@ class AgentTools(llm.ToolContext):
 
     # ── Tool: End Call ────────────────────────────────────────────────────
     @llm.function_tool(description="End the call. Use ONLY when caller says bye/goodbye or after booking is fully confirmed.")
-    async def end_call(self) -> str:
+    async def end_call(
+    self,
+    reason: Annotated[str, "Reason for ending the call"] = "completed",
+    ) -> str:
         logger.info("[TOOL] end_call triggered — hanging up.")
         try:
             if self.ctx_api and self.room_name and self._sip_identity:
