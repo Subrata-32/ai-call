@@ -316,7 +316,16 @@ class AgentTools(llm.ToolContext):
             return "I'm having trouble checking the calendar right now."
 
     # ── Tool: Business Hours (#31) ────────────────────────────────────────
-    @llm.function_tool(description="Check if the business is currently open and what the operating hours are.")
+    @llm.function_tool(
+        raw_schema={
+            "name": "get_business_hours",
+            "description": "Check if the business is currently open and what the operating hours are.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        }
+    )
     async def get_business_hours(self) -> str:
         ist  = pytz.timezone("Asia/Kolkata")
         now  = datetime.now(ist)
