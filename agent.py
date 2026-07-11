@@ -427,6 +427,16 @@ class AgentTools(llm.ToolContext):
 # AGENT CLASS
 # ══════════════════════════════════════════════════════════════════════════════
 
+async def speak_initial_greeting(session, greeting: str, logger_obj) -> None:
+    """Use the supported LiveKit speech API to start the call with a greeting."""
+    if not greeting:
+        return
+    try:
+        await session.say(greeting, allow_interruptions=False)
+    except Exception as exc:
+        logger_obj.warning(f"[GREETING] Failed to send initial greeting: {exc}")
+
+
 class OutboundAssistant(Agent):
 
     def __init__(self, agent_tools: AgentTools, first_line: str = "", live_config: dict | None = None):
@@ -462,15 +472,15 @@ class OutboundAssistant(Agent):
                 "What kind of business are you running?"
             )
         )
-        await self.session.generate_reply(
-            instructions=f"Say exactly this phrase: '{greeting}'"
-        )
+        await speak_initial_greeting(self.session, greeting, logger)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN ENTRYPOINT
 # ══════════════════════════════════════════════════════════════════════════════
 
+# NOTE: agent_is_speaking is no longer used to gate replies.
+# The AgentSession pipeline manages speech scheduling internally.
 agent_is_speaking = False
 
 
@@ -756,62 +766,40 @@ async def entrypoint(ctx: JobContext):
         "haan", "han", "theek", "theek hai", "accha", "ji", "ha",
     }
 
-    async def _respond_to_user(transcript: str) -> None:
-        global agent_is_speaking
-        if agent_is_speaking:
-            return
-
-        try:
-            await session.generate_reply(
-                instructions=(
-                    "Respond naturally to the caller in 1-2 short sentences. "
-                    "Keep the conversation flowing and ask one simple follow-up question if appropriate. "
-                    f"Caller said: {transcript}"
-                )
-            )
-        except Exception as exc:
-            logger.warning(f"[REPLY] Failed to respond: {exc}")
-
+    # ── user_speech_committed: logging + turn counting only ───────────────
+    # IMPORTANT: Do NOT call session.generate_reply() here.
+    # AgentSession handles replies automatically via its internal pipeline.
+    # Manually calling generate_reply() causes "speech scheduling is paused"
+    # which silently drops the agent response after the greeting.
     @session.on("user_speech_committed")
     def on_user_speech_committed(ev):
         nonlocal turn_count
-        global agent_is_speaking
 
         transcript = ev.user_transcript.strip()
         transcript_lower = transcript.lower().rstrip(".")
 
-        if agent_is_speaking:
-            logger.debug(f"[FILTER-ECHO] Dropped: '{transcript}'")
-            return
         if not transcript or len(transcript) < 3:
             return
         if transcript_lower in FILLER_WORDS:
-            logger.debug(f"[FILTER-FILLER] Dropped: '{transcript}'")
-            return
+            logger.debug(f"[FILTER-FILLER] Logged but not blocked: '{transcript}'")
 
         asyncio.create_task(_log_transcript("user", transcript))
 
         turn_count += 1
         logger.info(f"[TRANSCRIPT] Turn {turn_count}/{max_turns}: '{transcript}'")
 
+        # At max turns, inject a wrap-up instruction into the next auto-reply
+        # by updating the agent instructions dynamically.
         if turn_count >= max_turns:
-            logger.info(f"[LIMIT] Reached {max_turns} turns — wrapping up")
-            asyncio.create_task(
-                session.generate_reply(
-                    instructions="Politely wrap up: thank the caller, say they can call back anytime, and say a warm goodbye."
-                )
+            logger.info(f"[LIMIT] Reached {max_turns} turns — injecting wrap-up instruction")
+            agent.instructions = (
+                agent.instructions +
+                "\n\n[SYSTEM: This is your final turn. Politely wrap up: "
+                "thank the caller warmly, say they can call back anytime, and say a warm goodbye.]"
             )
-            return
 
-        asyncio.create_task(_respond_to_user(transcript))
-
-    register_session_handlers(
-        session=session,
-        on_agent_speech_started=_agent_speech_started,
-        on_agent_speech_finished=_agent_speech_finished,
-        on_agent_speech_interrupted=_on_interrupted,
-        on_user_speech_committed=on_user_speech_committed,
-    )
+    # NOTE: Handlers already registered above via @session.on(...) decorators.
+    # register_session_handlers() call removed to prevent double-registration.
 
     await session.start(room=ctx.room, agent=agent, room_input_options=room_input)
 
