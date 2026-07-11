@@ -40,11 +40,11 @@ from livekit.agents import (
     Agent,
     AgentSession,
     JobContext,
-    RoomInputOptions,
     WorkerOptions,
     cli,
     llm,
 )
+from livekit.agents.room_io import RoomOptions, AudioInputOptions
 from livekit.plugins import openai
 import db  # singleton Supabase client — imported here so it's available everywhere
 from provider_config import resolve_speech_provider
@@ -432,7 +432,10 @@ async def speak_initial_greeting(session, greeting: str, logger_obj) -> None:
     if not greeting:
         return
     try:
-        await session.say(greeting, allow_interruptions=False)
+        # allow_interruptions=True: if caller speaks during greeting, capture it.
+        # allow_interruptions=False would silently drop caller speech and cause
+        # the agent to go completely silent after the greeting.
+        await session.say(greeting, allow_interruptions=True)
     except Exception as exc:
         logger_obj.warning(f"[GREETING] Failed to send initial greeting: {exc}")
 
@@ -665,14 +668,18 @@ async def entrypoint(ctx: JobContext):
         stt_model = live_config.get("stt_model", "") or _env("OPENAI_TRANSCRIPTION_MODEL", "")
         if not stt_model:
             raise RuntimeError("OPENAI_TRANSCRIPTION_MODEL is required. Configure it in Railway Environment Variables.")
+        # use_realtime=False: the Realtime API has its own VAD that conflicts with
+        # turn_detection="stt" in AgentSession — this causes sessions where the STT
+        # never commits user speech. Standard streaming STT is more reliable for SIP.
+        _use_realtime = _env("OPENAI_STT_REALTIME", "false").lower() == "true"
         agent_stt = openai.STT(
             model=stt_model,
             language="" if stt_language in ("unknown", "auto", "") else stt_language,
             detect_language=stt_language in ("unknown", "auto", ""),
-            use_realtime=_env("OPENAI_STT_REALTIME", "true").lower() == "true",
+            use_realtime=_use_realtime,
             **_openai_kwargs(),
         )
-        logger.info(f"[STT] OpenAI | model={stt_model} | realtime={_env('OPENAI_STT_REALTIME', 'true')}")
+        logger.info(f"[STT] OpenAI | model={stt_model} | realtime={_use_realtime}")
 
     if tts_provider == "deepgram":
         deepgram_key = _env("DEEPGRAM_API_KEY")
@@ -728,12 +735,17 @@ async def entrypoint(ctx: JobContext):
         _noise_cancel = None
         logger.info("[AUDIO] BVC not available — running without noise cancellation")
 
-    room_input = RoomInputOptions(close_on_disconnect=False)
+    # RoomOptions is the v1.x replacement for deprecated RoomInputOptions
     if _noise_cancel:
         try:
-            room_input = RoomInputOptions(close_on_disconnect=False, noise_cancellation=_noise_cancel)
+            room_input = RoomOptions(
+                close_on_disconnect=False,
+                audio_input=AudioInputOptions(noise_cancellation=_noise_cancel),
+            )
         except Exception:
-            room_input = RoomInputOptions(close_on_disconnect=False)
+            room_input = RoomOptions(close_on_disconnect=False)
+    else:
+        room_input = RoomOptions(close_on_disconnect=False)
 
     session = AgentSession(
         stt=agent_stt,
@@ -801,7 +813,7 @@ async def entrypoint(ctx: JobContext):
     # NOTE: Handlers already registered above via @session.on(...) decorators.
     # register_session_handlers() call removed to prevent double-registration.
 
-    await session.start(room=ctx.room, agent=agent, room_input_options=room_input)
+    await session.start(room=ctx.room, agent=agent, room_options=room_input)
 
     # ── TTS pre-warm (#12) ────────────────────────────────────────────────
     try:
