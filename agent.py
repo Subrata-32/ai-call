@@ -831,7 +831,8 @@ async def entrypoint(ctx: JobContext):
     async def unified_shutdown_hook(shutdown_ctx: JobContext):
         logger.info("[SHUTDOWN] Sequence started.")
 
-        duration = int((datetime.now() - call_start_time).total_seconds())
+        now_dt = datetime.now(call_start_time.tzinfo or pytz.utc)
+        duration = int((now_dt - call_start_time).total_seconds())
 
         # ── Quality score for self-training ──────────────────────────────────
         def _compute_quality_score(booked: bool, sent: str, dur: int, interrupts: int) -> int:
