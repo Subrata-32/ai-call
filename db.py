@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+from urllib.parse import urlparse
 from supabase import create_client, Client
 
 logger = logging.getLogger("db")
@@ -19,6 +20,39 @@ _BASE_COLUMNS = {"phone_number", "duration_seconds", "transcript", "summary",
 _supabase_client: Client | None = None
 _supabase_url:   str = ""
 _supabase_key:   str = ""
+
+
+def normalize_supabase_url(raw_url: str) -> str:
+    """Convert dashboard/project URLs into the proper Supabase project API base."""
+    raw_url = (raw_url or "").strip()
+    if not raw_url:
+        return ""
+
+    if "/dashboard/project/" in raw_url:
+        project_ref = raw_url.split("/dashboard/project/", 1)[1].split("/", 1)[0].split("?", 1)[0]
+        if project_ref:
+            return f"https://{project_ref}.supabase.co"
+
+    parsed = urlparse(raw_url)
+    host = parsed.netloc.lower()
+    if host.endswith(".storage.supabase.co"):
+        project_ref = host.split(".storage.supabase.co", 1)[0]
+        return f"https://{project_ref}.supabase.co"
+
+    if host.endswith(".supabase.co") or host == "supabase.co":
+        return f"{parsed.scheme or 'https'}://{host}".rstrip("/")
+
+    return raw_url.rstrip("/")
+
+
+def build_supabase_storage_url(base_url: str, object_path: str) -> str:
+    """Build a public storage URL from a Supabase project base URL."""
+    base = normalize_supabase_url(base_url)
+    if not base:
+        return ""
+    path = (object_path or "").lstrip("/")
+    return f"{base}/storage/v1/object/public/{path}" if path else f"{base}/storage/v1/object/public"
+
 
 def get_supabase() -> Client | None:
     """Return a singleton Supabase client; re-create only if credentials changed."""

@@ -131,6 +131,23 @@ def count_tokens(text: str) -> int:
         return len(text.split())
 
 
+def prepare_tts_text(agent_response: str) -> str:
+    """Return a compact TTS chunk while preserving the opening greeting."""
+    text = (agent_response or "").strip()
+    if not text:
+        return text
+
+    if text.lower().startswith("say exactly this phrase:"):
+        text = text.split(":", 1)[1].strip().strip("'")
+
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    chunk = " ".join(sentences[:2]).strip() if len(sentences) > 2 else text
+
+    if len(chunk) > 260:
+        chunk = chunk[:257].rsplit(" ", 1)[0] + "..."
+    return chunk
+
+
 # ── IST time context ──────────────────────────────────────────────────────────
 def get_ist_time_context() -> str:
     ist = pytz.timezone("Asia/Kolkata")
@@ -401,8 +418,8 @@ class OutboundAssistant(Agent):
         greeting = self._live_config.get(
             "first_line",
             self._first_line or (
-                "Namaste! This is Aryan from RapidX AI — we help businesses automate with AI. "
-                "Hmm, may I ask what kind of business you run?"
+                "Hello, this is Aryan from RapidX AI. I help businesses with AI voice agents and automation. "
+                "What kind of business are you running?"
             )
         )
         await self.session.generate_reply(
@@ -415,6 +432,15 @@ class OutboundAssistant(Agent):
 # ══════════════════════════════════════════════════════════════════════════════
 
 agent_is_speaking = False
+
+
+def register_session_handlers(session, on_agent_speech_started, on_agent_speech_finished,
+                              on_agent_speech_interrupted, on_user_speech_committed):
+    session.on("agent_speech_started", on_agent_speech_started)
+    session.on("agent_speech_finished", on_agent_speech_finished)
+    session.on("agent_speech_interrupted", on_agent_speech_interrupted)
+    session.on("user_speech_committed", on_user_speech_committed)
+
 
 async def entrypoint(ctx: JobContext):
     global agent_is_speaking
@@ -628,20 +654,9 @@ async def entrypoint(ctx: JobContext):
         )
         logger.info(f"[TTS] OpenAI | model={tts_model} | voice={tts_voice}")
 
-    # ── Sentence chunker — first sentence only for minimum perceived latency ──
+    # ── Sentence chunker — preserve the opening greeting and keep later replies short ──
     def before_tts_cb(agent_response: str) -> str:
-        """Extract only the first sentence to start TTS as fast as possible."""
-        text = agent_response.strip()
-        if not text:
-            return text
-        # Handle English . ! ? and Hindi ।  — split on sentence boundaries
-        parts = re.split(r'(?<=[।\.!?])\s+', text)
-        first = parts[0].strip() if parts else text
-        # Safety cap: 250 chars max to avoid TTS timeouts
-        if len(first) > 250:
-            # Truncate at word boundary
-            first = first[:250].rsplit(" ", 1)[0] + "..."
-        return first
+        return prepare_tts_text(agent_response)
 
     # ── Turn counter + auto-close (#29) ──────────────────────────────────
     turn_count    = 0
@@ -677,6 +692,85 @@ async def entrypoint(ctx: JobContext):
         turn_detection="stt",
         min_endpointing_delay=float(delay_setting),  # 0.05s — optimized for low latency
         allow_interruptions=True,
+    )
+
+    @session.on("agent_speech_started")
+    def _agent_speech_started(ev):
+        global agent_is_speaking
+        agent_is_speaking = True
+
+    @session.on("agent_speech_finished")
+    def _agent_speech_finished(ev):
+        global agent_is_speaking
+        agent_is_speaking = False
+
+    @session.on("agent_speech_interrupted")
+    def _on_interrupted(ev):
+        nonlocal interrupt_count
+        interrupt_count += 1
+        logger.info(f"[INTERRUPT] Agent interrupted. Total: {interrupt_count}")
+
+    FILLER_WORDS = {
+        "okay.", "okay", "ok", "uh", "hmm", "hm", "yeah", "yes",
+        "no", "um", "ah", "oh", "right", "sure", "fine", "good",
+        "haan", "han", "theek", "theek hai", "accha", "ji", "ha",
+    }
+
+    async def _respond_to_user(transcript: str) -> None:
+        global agent_is_speaking
+        if agent_is_speaking:
+            return
+
+        try:
+            await session.generate_reply(
+                instructions=(
+                    "Respond naturally to the caller in 1-2 short sentences. "
+                    "Keep the conversation flowing and ask one simple follow-up question if appropriate. "
+                    f"Caller said: {transcript}"
+                )
+            )
+        except Exception as exc:
+            logger.warning(f"[REPLY] Failed to respond: {exc}")
+
+    @session.on("user_speech_committed")
+    def on_user_speech_committed(ev):
+        nonlocal turn_count
+        global agent_is_speaking
+
+        transcript = ev.user_transcript.strip()
+        transcript_lower = transcript.lower().rstrip(".")
+
+        if agent_is_speaking:
+            logger.debug(f"[FILTER-ECHO] Dropped: '{transcript}'")
+            return
+        if not transcript or len(transcript) < 3:
+            return
+        if transcript_lower in FILLER_WORDS:
+            logger.debug(f"[FILTER-FILLER] Dropped: '{transcript}'")
+            return
+
+        asyncio.create_task(_log_transcript("user", transcript))
+
+        turn_count += 1
+        logger.info(f"[TRANSCRIPT] Turn {turn_count}/{max_turns}: '{transcript}'")
+
+        if turn_count >= max_turns:
+            logger.info(f"[LIMIT] Reached {max_turns} turns — wrapping up")
+            asyncio.create_task(
+                session.generate_reply(
+                    instructions="Politely wrap up: thank the caller, say they can call back anytime, and say a warm goodbye."
+                )
+            )
+            return
+
+        asyncio.create_task(_respond_to_user(transcript))
+
+    register_session_handlers(
+        session=session,
+        on_agent_speech_started=_agent_speech_started,
+        on_agent_speech_finished=_agent_speech_finished,
+        on_agent_speech_interrupted=_on_interrupted,
+        on_user_speech_committed=on_user_speech_committed,
     )
 
     await session.start(room=ctx.room, agent=agent, room_input_options=room_input)
@@ -762,60 +856,6 @@ async def entrypoint(ctx: JobContext):
             logger.debug(f"[TRANSCRIPT-STREAM] {e}")
 
     # ── Session event handlers ────────────────────────────────────────────
-    @session.on("agent_speech_started")
-    def _agent_speech_started(ev):
-        global agent_is_speaking
-        agent_is_speaking = True
-
-    @session.on("agent_speech_finished")
-    def _agent_speech_finished(ev):
-        global agent_is_speaking
-        agent_is_speaking = False
-
-    # Interrupt logging (#30)
-    @session.on("agent_speech_interrupted")
-    def _on_interrupted(ev):
-        nonlocal interrupt_count
-        interrupt_count += 1
-        logger.info(f"[INTERRUPT] Agent interrupted. Total: {interrupt_count}")
-
-
-    FILLER_WORDS = {
-        "okay.", "okay", "ok", "uh", "hmm", "hm", "yeah", "yes",
-        "no", "um", "ah", "oh", "right", "sure", "fine", "good",
-        "haan", "han", "theek", "theek hai", "accha", "ji", "ha",
-    }
-
-    @session.on("user_speech_committed")
-    def on_user_speech_committed(ev):
-        nonlocal turn_count
-        global agent_is_speaking
-
-        transcript = ev.user_transcript.strip()
-        transcript_lower = transcript.lower().rstrip(".")
-
-        if agent_is_speaking:
-            logger.debug(f"[FILTER-ECHO] Dropped: '{transcript}'")
-            return
-        if not transcript or len(transcript) < 3:
-            return
-        if transcript_lower in FILLER_WORDS:
-            logger.debug(f"[FILTER-FILLER] Dropped: '{transcript}'")
-            return
-
-        # Real-time transcript stream
-        asyncio.create_task(_log_transcript("user", transcript))
-
-        # Turn counter + auto-close (#29)
-        turn_count += 1
-        logger.info(f"[TRANSCRIPT] Turn {turn_count}/{max_turns}: '{transcript}'")
-        if turn_count >= max_turns:
-            logger.info(f"[LIMIT] Reached {max_turns} turns — wrapping up")
-            asyncio.create_task(
-                session.generate_reply(
-                    instructions="Politely wrap up: thank the caller, say they can call back anytime, and say a warm goodbye."
-                )
-            )
 
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant):
@@ -951,9 +991,9 @@ async def entrypoint(ctx: JobContext):
                 )
                 await stop_api.egress.stop_egress(api.StopEgressRequest(egress_id=egress_id))
                 await stop_api.aclose()
-                recording_url = (
-                    f"{os.environ.get('SUPABASE_URL','')}/storage/v1/object/public/"
-                    f"call-recordings/recordings/{ctx.room.name}.ogg"
+                recording_url = db.build_supabase_storage_url(
+                    os.environ.get("SUPABASE_URL", ""),
+                    f"call-recordings/recordings/{ctx.room.name}.ogg",
                 )
                 logger.info(f"[RECORDING] Stopped. URL: {recording_url}")
             except Exception as e:

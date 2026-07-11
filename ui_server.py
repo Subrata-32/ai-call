@@ -23,6 +23,13 @@ def read_config():
     def get_val(key, env_key, default=""):
         return config.get(key) if config.get(key) else os.getenv(env_key, default)
 
+    supabase_url = get_val("supabase_url", "SUPABASE_URL", "")
+    try:
+        from db import normalize_supabase_url
+        supabase_url = normalize_supabase_url(supabase_url)
+    except Exception:
+        pass
+
     return {
         "first_line": get_val("first_line", "FIRST_LINE", "Namaste! This is Aryan from RapidX AI — we help businesses automate with AI. Hmm, may I ask what kind of business you run?"),
         "agent_instructions": get_val("agent_instructions", "AGENT_INSTRUCTIONS", ""),
@@ -40,7 +47,7 @@ def read_config():
         "cal_event_type_id": get_val("cal_event_type_id", "CAL_EVENT_TYPE_ID", ""),
         "telegram_bot_token": get_val("telegram_bot_token", "TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": get_val("telegram_chat_id", "TELEGRAM_CHAT_ID", ""),
-        "supabase_url": get_val("supabase_url", "SUPABASE_URL", ""),
+        "supabase_url": supabase_url,
         "supabase_key": get_val("supabase_key", "SUPABASE_KEY", ""),
         **config
     }
