@@ -27,15 +27,15 @@ def read_config():
         "first_line": get_val("first_line", "FIRST_LINE", "Namaste! This is Aryan from RapidX AI — we help businesses automate with AI. Hmm, may I ask what kind of business you run?"),
         "agent_instructions": get_val("agent_instructions", "AGENT_INSTRUCTIONS", ""),
         "stt_min_endpointing_delay": float(get_val("stt_min_endpointing_delay", "STT_MIN_ENDPOINTING_DELAY", 0.6)),
-        "llm_model": get_val("llm_model", "LLM_MODEL", "gpt-4o-mini"),
-        "tts_voice": get_val("tts_voice", "TTS_VOICE", "kavya"),
+        "llm_provider": get_val("llm_provider", "LLM_PROVIDER", "openai"),
+        "llm_model": get_val("llm_model", "LLM_MODEL", "gpt-4.1-mini"),
+        "tts_voice": get_val("tts_voice", "TTS_VOICE", "alloy"),
         "tts_language": get_val("tts_language", "TTS_LANGUAGE", "hi-IN"),
         "livekit_url": get_val("livekit_url", "LIVEKIT_URL", ""),
         "sip_trunk_id": get_val("sip_trunk_id", "SIP_TRUNK_ID", ""),
         "livekit_api_key": get_val("livekit_api_key", "LIVEKIT_API_KEY", ""),
         "livekit_api_secret": get_val("livekit_api_secret", "LIVEKIT_API_SECRET", ""),
         "openai_api_key": get_val("openai_api_key", "OPENAI_API_KEY", ""),
-        "sarvam_api_key": get_val("sarvam_api_key", "SARVAM_API_KEY", ""),
         "cal_api_key": get_val("cal_api_key", "CAL_API_KEY", ""),
         "cal_event_type_id": get_val("cal_event_type_id", "CAL_EVENT_TYPE_ID", ""),
         "telegram_bot_token": get_val("telegram_bot_token", "TELEGRAM_BOT_TOKEN", ""),
@@ -747,7 +747,7 @@ async def get_dashboard():
       </div>
     </div>
     <div class="section-card">
-      <div class="section-title">Voice Synthesis (Sarvam bulbul:v3)</div>
+      <div class="section-title">Voice Synthesis (OpenAI TTS)</div>
       <div class="form-row" style="max-width:720px;">
         <div class="form-group">
           <label>Speaker Voice</label>
@@ -919,7 +919,6 @@ async def get_dashboard():
       <div class="section-title">AI Providers</div>
       <div class="form-row">
         <div class="form-group"><label>OpenAI API Key</label><input type="password" id="openai_api_key" value="{config.get('openai_api_key', '')}"></div>
-        <div class="form-group"><label>Sarvam API Key</label><input type="password" id="sarvam_api_key" value="{config.get('sarvam_api_key', '')}"></div>
       </div>
     </div>
     <div class="section-card">
@@ -1191,7 +1190,7 @@ async function saveConfig(section) {{
     Object.assign(payload, {{
       livekit_url: get('livekit_url'), sip_trunk_id: get('sip_trunk_id'),
       livekit_api_key: get('livekit_api_key'), livekit_api_secret: get('livekit_api_secret'),
-      openai_api_key: get('openai_api_key'), sarvam_api_key: get('sarvam_api_key'),
+      openai_api_key: get('openai_api_key'),
       cal_api_key: get('cal_api_key'), cal_event_type_id: get('cal_event_type_id'),
       telegram_bot_token: get('telegram_bot_token'), telegram_chat_id: get('telegram_chat_id'),
       supabase_url: get('supabase_url'), supabase_key: get('supabase_key'),

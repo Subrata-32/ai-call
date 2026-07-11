@@ -7,6 +7,19 @@ from datetime import datetime
 logger = logging.getLogger("calendar-tools")
 
 CAL_BASE = "https://api.cal.com/v1"
+_requests_session = requests.Session()
+_async_client: httpx.AsyncClient | None = None
+
+
+def _get_async_client(timeout: float = 4.0) -> httpx.AsyncClient:
+    """Reuse outbound HTTP connections to reduce booking/calendar network latency."""
+    global _async_client
+    if _async_client is None or _async_client.is_closed:
+        _async_client = httpx.AsyncClient(
+            timeout=timeout,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+    return _async_client
 
 
 def get_cal_creds() -> dict:
@@ -41,7 +54,8 @@ def _get_slots_calcom(date_str: str) -> list:
     creds = get_cal_creds()
     for attempt in range(2):  # retry once on transient error
         try:
-            resp = requests.get(
+            # Optimization: reuse TCP/TLS connections across slot checks.
+            resp = _requests_session.get(
                 f"{CAL_BASE}/slots",
                 headers={"Content-Type": "application/json"},
                 params={
@@ -257,7 +271,8 @@ def cancel_booking(booking_id: str, reason: str = "Cancelled by caller") -> dict
     """Cancel a Cal.com booking by UID."""
     creds = get_cal_creds()
     try:
-        resp = requests.delete(
+        # Optimization: reuse TCP/TLS connections across cancellation requests.
+        resp = _requests_session.delete(
             f"{CAL_BASE}/bookings/{booking_id}/cancel?apiKey={creds['api_key']}",
             headers={"Content-Type": "application/json"},
             json={"reason": reason},

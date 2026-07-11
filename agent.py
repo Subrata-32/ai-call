@@ -45,10 +45,25 @@ from livekit.agents import (
     cli,
     llm,
 )
-from livekit.plugins import openai, sarvam, groq
+from livekit.plugins import openai
 import db  # singleton Supabase client — imported here so it's available everywhere
+from provider_config import resolve_speech_provider
 
 CONFIG_FILE = "config.json"
+OPENAI_BASE_URL_ENV = "OPENAI_BASE_URL"
+
+
+def _env(name: str, default: str = "") -> str:
+    return os.environ.get(name, default).strip()
+
+
+def _openai_kwargs() -> dict:
+    """Centralizes OpenAI env config so Railway can change keys/URLs without code edits."""
+    kwargs = {"api_key": _env("OPENAI_API_KEY")}
+    base_url = _env(OPENAI_BASE_URL_ENV)
+    if base_url:
+        kwargs["base_url"] = base_url
+    return kwargs
 
 # ── Rate limiting (#37) ───────────────────────────────────────────────────────
 _call_timestamps: dict = defaultdict(list)
@@ -87,20 +102,23 @@ def get_live_config(phone_number: str | None = None):
                 logger.error(f"[CONFIG] Failed to read {path}: {e}")
 
     return {
+        **config,
         "agent_instructions":       config.get("agent_instructions", ""),
         "stt_min_endpointing_delay":config.get("stt_min_endpointing_delay", 0.05),
-        "llm_model":                config.get("llm_model", "gpt-4o-mini"),
-        "llm_provider":             config.get("llm_provider", "openai"),
+        # Optimization: force one OpenAI provider path so no stale config can add fallback latency.
+        "llm_provider":             "openai",
+        "stt_provider":             "openai",
+        "tts_provider":             "openai",
+        "llm_model":                _env("OPENAI_MODEL", config.get("openai_model") or config.get("llm_model", "")),
         "llm_temperature":          float(config.get("llm_temperature", 0.3)),
         "max_completion_tokens":    int(config.get("max_completion_tokens", 80)),
-        "tts_voice":                config.get("tts_voice", "kavya"),
+        "tts_voice":                _env("OPENAI_TTS_VOICE", config.get("openai_tts_voice") or config.get("tts_voice", "")),
         "tts_language":             config.get("tts_language", "hi-IN"),
-        "tts_provider":             config.get("tts_provider", "sarvam"),
-        "stt_provider":             config.get("stt_provider", "sarvam"),
+        "tts_model":                _env("OPENAI_TTS_MODEL", config.get("openai_tts_model", "")),
+        "stt_model":                _env("OPENAI_TRANSCRIPTION_MODEL", config.get("openai_transcription_model", "")),
         "stt_language":             config.get("stt_language", "unknown"),
         "lang_preset":              config.get("lang_preset", "multilingual"),
         "max_turns":                config.get("max_turns", 25),
-        **config,
     }
 
 
@@ -449,22 +467,15 @@ async def entrypoint(ctx: JobContext):
     llm_provider  = live_config.get("llm_provider", "openai")
     tts_voice     = live_config.get("tts_voice", "kavya")
     tts_language  = live_config.get("tts_language", "hi-IN")
-    tts_provider  = live_config.get("tts_provider", "sarvam")
-    stt_provider  = live_config.get("stt_provider", "sarvam")
+    tts_provider  = resolve_speech_provider(live_config.get("tts_provider"), os.getenv("TTS_PROVIDER"), "deepgram")
+    stt_provider  = resolve_speech_provider(live_config.get("stt_provider"), os.getenv("STT_PROVIDER"), "deepgram")
     stt_language  = live_config.get("stt_language", "unknown")  # auto-detect (#20)
     max_turns     = live_config.get("max_turns", 25)
 
-    # Override OS env vars from UI config (includes Twilio keys)
+    # Optimization: do not hydrate secrets/providers from config.json; Railway env remains source of truth.
     for key in [
-        "LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET",
-        "OPENAI_API_KEY", "GROQ_API_KEY", "ANTHROPIC_API_KEY",
-        "SARVAM_API_KEY",
-        "CAL_API_KEY", "CAL_EVENT_TYPE_ID",
-        "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
-        "SUPABASE_URL", "SUPABASE_KEY",
-        "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN",
-        "TWILIO_PHONE_NUMBER", "TWILIO_SIP_DOMAIN",
         "DEFAULT_TRANSFER_NUMBER",
+        "TWILIO_SIP_DOMAIN",
         "VOBIZ_SIP_DOMAIN",  # legacy fallback
     ]:
         val = live_config.get(key.lower(), "")
@@ -479,12 +490,15 @@ async def entrypoint(ctx: JobContext):
             sb = db.get_supabase()
             if not sb:
                 return ""
-            result = (sb.table("call_logs")
-                        .select("summary, created_at")
-                        .eq("phone_number", phone)
-                        .order("created_at", desc=True)
-                        .limit(1)
-                        .execute())
+            def _fetch_last_call():
+                return (sb.table("call_logs")
+                            .select("summary, created_at")
+                            .eq("phone_number", phone)
+                            .order("created_at", desc=True)
+                            .limit(1)
+                            .execute())
+            # Optimization: Supabase SDK is synchronous; move it off the event loop.
+            result = await asyncio.to_thread(_fetch_last_call)
             if result.data:
                 last = result.data[0]
                 return f"\n\n[CALLER HISTORY: Last call {last['created_at'][:10]}. Summary: {last['summary']}]"
@@ -492,23 +506,29 @@ async def entrypoint(ctx: JobContext):
             logger.warning(f"[MEMORY] Could not load history: {e}")
         return ""
 
-    caller_history = await get_caller_history(caller_phone)
+    # Optimization: caller memory and lessons are independent DB reads, so fetch them in parallel.
+    caller_history, improvement_notes = await asyncio.gather(
+        get_caller_history(caller_phone),
+        db.load_improvement_notes(limit=5),
+        return_exceptions=True,
+    )
+    if isinstance(caller_history, Exception):
+        logger.debug(f"[MEMORY] Could not load history: {caller_history}")
+        caller_history = ""
+    if isinstance(improvement_notes, Exception):
+        logger.debug(f"[SELF-TRAIN] Could not load improvement notes: {improvement_notes}")
+        improvement_notes = ""
     if caller_history:
         logger.info(f"[MEMORY] Loaded caller history for {caller_phone}")
         # Append to live_config instructions
         live_config["agent_instructions"] = (live_config.get("agent_instructions","") + caller_history)
 
     # ── Self-training: inject improvement notes from low-quality past calls ───
-    try:
-        from db import load_improvement_notes
-        improvement_notes = await load_improvement_notes(limit=5)
-        if improvement_notes:
-            live_config["agent_instructions"] = (
-                live_config.get("agent_instructions", "") + improvement_notes
-            )
-            logger.info("[SELF-TRAIN] Improvement notes injected into system prompt")
-    except Exception as _st_err:
-        logger.debug(f"[SELF-TRAIN] Could not load improvement notes: {_st_err}")
+    if improvement_notes:
+        live_config["agent_instructions"] = (
+            live_config.get("agent_instructions", "") + improvement_notes
+        )
+        logger.info("[SELF-TRAIN] Improvement notes injected into system prompt")
 
     # ── Instantiate tools ─────────────────────────────────────────────────
     agent_tools = AgentTools(caller_phone=caller_phone, caller_name=caller_name)
@@ -520,190 +540,84 @@ async def entrypoint(ctx: JobContext):
 
     # ══════════════════════════════════════════════════════════════════════
     # BUILD LLM — Smart provider selection
-    # Priority (auto mode): Groq → Cerebras → Gemini → OpenAI
+    # Provider: OpenAI only
     # All providers use temperature=0.3 for zero hallucination
     # ══════════════════════════════════════════════════════════════════════
     llm_temperature     = float(live_config.get("llm_temperature", 0.3))
     max_completion_toks = int(live_config.get("max_completion_tokens", 80))
 
     # ── Auto-select best free provider based on available keys ────────────
-    if llm_provider == "auto":
-        if os.environ.get("GROQ_API_KEY"):
-            llm_provider = "groq"
-            llm_model    = llm_model or "llama-3.3-70b-versatile"
-            logger.info("[LLM] Auto-selected: Groq (fastest free LLM ~40ms)")
-        elif os.environ.get("CEREBRAS_API_KEY"):
-            llm_provider = "cerebras"
-            llm_model    = llm_model or "llama-3.3-70b"
-            logger.info("[LLM] Auto-selected: Cerebras (world's fastest ~20ms)")
-        elif os.environ.get("GEMINI_API_KEY"):
-            llm_provider = "gemini"
-            llm_model    = llm_model or "gemini-2.0-flash"
-            logger.info("[LLM] Auto-selected: Gemini 2.0 Flash (best Hindi support)")
-        else:
-            llm_provider = "openai"
-            llm_model    = llm_model or "gpt-4o-mini"
-            logger.info("[LLM] Auto-selected: OpenAI GPT-4o-mini (fallback)")
+    if llm_provider != "openai":
+        logger.warning("[LLM] Ignoring non-OpenAI provider config: %s", llm_provider)
+        llm_provider = "openai"
 
-    # ── Build the chosen provider ─────────────────────────────────────────
-    if llm_provider == "groq":
-        # 🥇 GROQ — Free, ~40ms, Llama 3.3 70B quality
-        # Free tier: 14,400 req/day | console.groq.com
-        _groq_key = os.environ.get("GROQ_API_KEY", "")
-        if not _groq_key:
-            logger.warning("[LLM] GROQ_API_KEY missing — falling back to OpenAI")
-            agent_llm = openai.LLM(
-                model="gpt-4o-mini",
-                max_completion_tokens=max_completion_toks,
-                temperature=llm_temperature,
-            )
-        else:
-            agent_llm = groq.LLM(
-                model=llm_model or "llama-3.3-70b-versatile",
-                api_key=_groq_key,
-                max_completion_tokens=max_completion_toks,
-                temperature=llm_temperature,
-            )
-        logger.info(f"[LLM] Groq | model={llm_model} | temp={llm_temperature} | max_tokens={max_completion_toks}")
+    # Build OpenAI LLM only. No provider auto-selection keeps latency predictable.
+    if not _env("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY is required. Configure it in Railway Environment Variables.")
+    if not llm_model:
+        raise RuntimeError("OPENAI_MODEL is required. Configure it in Railway Environment Variables.")
+    # Optimization: one OpenAI LLM path avoids fallback checks, imports, and accidental cross-provider calls.
+    agent_llm = openai.LLM(
+        model=llm_model,
+        max_completion_tokens=max_completion_toks,
+        temperature=llm_temperature,
+        **_openai_kwargs(),
+    )
+    logger.info(f"[LLM] OpenAI | model={llm_model} | temp={llm_temperature} | max_tokens={max_completion_toks}")
 
-    elif llm_provider == "cerebras":
-        # ⚡ CEREBRAS — Free, ~20ms (world's fastest!), custom AI chips
-        # Free tier available | cloud.cerebras.ai
-        _cerebras_key = os.environ.get("CEREBRAS_API_KEY", "")
-        if not _cerebras_key:
-            logger.warning("[LLM] CEREBRAS_API_KEY missing — falling back to Groq/OpenAI")
-            _fallback_key = os.environ.get("GROQ_API_KEY", "")
-            if _fallback_key:
-                agent_llm = groq.LLM(
-                    model="llama-3.3-70b-versatile",
-                    api_key=_fallback_key,
-                    max_completion_tokens=max_completion_toks,
-                    temperature=llm_temperature,
-                )
-            else:
-                agent_llm = openai.LLM(
-                    model="gpt-4o-mini",
-                    max_completion_tokens=max_completion_toks,
-                    temperature=llm_temperature,
-                )
-        else:
-            # Cerebras uses OpenAI-compatible API
-            agent_llm = openai.LLM(
-                model=llm_model or "llama-3.3-70b",
-                base_url="https://api.cerebras.ai/v1",
-                api_key=_cerebras_key,
-                max_completion_tokens=max_completion_toks,
-                temperature=llm_temperature,
-            )
-        logger.info(f"[LLM] Cerebras | model={llm_model} | temp={llm_temperature} | max_tokens={max_completion_toks}")
-
-    elif llm_provider == "gemini":
-        # 🌍 GEMINI — Free 1M tokens/day, best Hindi/multilingual support
-        # Free tier | aistudio.google.com
-        _gemini_key = os.environ.get("GEMINI_API_KEY", "")
-        if not _gemini_key:
-            logger.warning("[LLM] GEMINI_API_KEY missing — falling back to Groq/OpenAI")
-            _fallback_key = os.environ.get("GROQ_API_KEY", "")
-            if _fallback_key:
-                agent_llm = groq.LLM(
-                    model="llama-3.3-70b-versatile",
-                    api_key=_fallback_key,
-                    max_completion_tokens=max_completion_toks,
-                    temperature=llm_temperature,
-                )
-            else:
-                agent_llm = openai.LLM(
-                    model="gpt-4o-mini",
-                    max_completion_tokens=max_completion_toks,
-                    temperature=llm_temperature,
-                )
-        else:
-            # Gemini OpenAI-compatible endpoint
-            agent_llm = openai.LLM(
-                model=llm_model or "gemini-2.0-flash",
-                base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-                api_key=_gemini_key,
-                max_completion_tokens=max_completion_toks,
-                temperature=llm_temperature,
-            )
-        logger.info(f"[LLM] Gemini | model={llm_model} | temp={llm_temperature} | max_tokens={max_completion_toks}")
-
-    elif llm_provider == "claude":
-        # Anthropic Claude (paid)
-        _anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        agent_llm = openai.LLM(
-            model=llm_model or "claude-haiku-3-5-latest",
-            base_url="https://api.anthropic.com/v1/",
-            api_key=_anthropic_key,
-            max_completion_tokens=max_completion_toks,
-            temperature=llm_temperature,
-        )
-        logger.info(f"[LLM] Claude | model={llm_model} | temp={llm_temperature} | max_tokens={max_completion_toks}")
-
-    else:
-        # OpenAI GPT-4o-mini (default paid fallback)
-        agent_llm = openai.LLM(
-            model=llm_model or "gpt-4o-mini",
-            max_completion_tokens=max_completion_toks,
-            temperature=llm_temperature,
-        )
-        logger.info(f"[LLM] OpenAI | model={llm_model} | temp={llm_temperature} | max_tokens={max_completion_toks}")
-
-    # ── Build STT (#1 16kHz, #20 auto-detect, #9 Deepgram) ──────────────
+    # Build STT/TTS using Deepgram first when available; fall back to OpenAI otherwise.
     if stt_provider == "deepgram":
-        try:
+        if not _env("DEEPGRAM_API_KEY"):
+            logger.warning("[STT] DEEPGRAM_API_KEY missing; falling back to OpenAI STT")
+            stt_provider = "openai"
+        else:
             from livekit.plugins import deepgram
+            stt_model = live_config.get("stt_model", "nova-2")
             agent_stt = deepgram.STT(
-                model="nova-2-general",
-                language="multi",        # multilingual mode
-                interim_results=False,
+                model=stt_model,
+                language="" if stt_language in ("unknown", "auto", "") else stt_language,
+                detect_language=stt_language in ("unknown", "auto", ""),
+                api_key=_env("DEEPGRAM_API_KEY"),
             )
-            logger.info("[STT] Using Deepgram Nova-2")
-        except ImportError:
-            logger.warning("[STT] deepgram plugin not installed — falling back to Sarvam")
-            agent_stt = sarvam.STT(
-                language=stt_language,
-                model="saaras:v3",
-                mode="translate",
-                flush_signal=True,
-                sample_rate=16000,
-            )
-    else:
-        agent_stt = sarvam.STT(
-            language=stt_language,      # "unknown" = auto-detect (#20)
-            model="saaras:v3",
-            mode="translate",
-            flush_signal=True,
-            sample_rate=16000,          # force 16kHz (#1)
-        )
-        logger.info("[STT] Using Sarvam Saaras v3")
+            logger.info(f"[STT] Deepgram | model={stt_model} | language={stt_language}")
 
-    # ── Build TTS (#2 24kHz, #10 ElevenLabs) ────────────────────────────
-    if tts_provider == "elevenlabs":
-        try:
-            from livekit.plugins import elevenlabs
-            _el_voice_id = live_config.get("elevenlabs_voice_id", "21m00Tcm4TlvDq8ikWAM")
-            agent_tts = elevenlabs.TTS(
-                model="eleven_turbo_v2_5",
-                voice_id=_el_voice_id,
-            )
-            logger.info(f"[TTS] Using ElevenLabs Turbo v2.5 — voice: {_el_voice_id}")
-        except ImportError:
-            logger.warning("[TTS] elevenlabs plugin not installed — falling back to Sarvam")
-            agent_tts = sarvam.TTS(
-                target_language_code=tts_language,
-                model="bulbul:v3",
-                speaker=tts_voice,
-                speech_sample_rate=24000,
-            )
-    else:
-        agent_tts = sarvam.TTS(
-            target_language_code=tts_language,
-            model="bulbul:v3",
-            speaker=tts_voice,
-            speech_sample_rate=24000,          # force 24kHz (#2)
+    if stt_provider == "openai":
+        stt_model = live_config.get("stt_model", "") or _env("OPENAI_TRANSCRIPTION_MODEL", "")
+        if not stt_model:
+            raise RuntimeError("OPENAI_TRANSCRIPTION_MODEL is required. Configure it in Railway Environment Variables.")
+        agent_stt = openai.STT(
+            model=stt_model,
+            language="" if stt_language in ("unknown", "auto", "") else stt_language,
+            detect_language=stt_language in ("unknown", "auto", ""),
+            use_realtime=_env("OPENAI_STT_REALTIME", "true").lower() == "true",
+            **_openai_kwargs(),
         )
-        logger.info(f"[TTS] Using Sarvam Bulbul v3 — voice: {tts_voice} lang: {tts_language}")
+        logger.info(f"[STT] OpenAI | model={stt_model} | realtime={_env('OPENAI_STT_REALTIME', 'true')}")
+
+    if tts_provider == "deepgram":
+        if not _env("DEEPGRAM_API_KEY"):
+            logger.warning("[TTS] DEEPGRAM_API_KEY missing; falling back to OpenAI TTS")
+            tts_provider = "openai"
+        else:
+            from livekit.plugins import deepgram
+            tts_model = live_config.get("tts_model", "aura-asteria-en")
+            agent_tts = deepgram.TTS(
+                model=tts_model,
+                voice=tts_voice or "aura-asteria-en",
+                api_key=_env("DEEPGRAM_API_KEY"),
+            )
+            logger.info(f"[TTS] Deepgram | model={tts_model} | voice={tts_voice or 'aura-asteria-en'}")
+
+    if tts_provider == "openai":
+        tts_model = live_config.get("tts_model", "") or _env("OPENAI_TTS_MODEL", "")
+        if not tts_model or not tts_voice:
+            raise RuntimeError("OPENAI_TTS_MODEL and OPENAI_TTS_VOICE are required. Configure them in Railway Environment Variables.")
+        agent_tts = openai.TTS(
+            model=tts_model,
+            voice=tts_voice,
+            **_openai_kwargs(),
+        )
+        logger.info(f"[TTS] OpenAI | model={tts_model} | voice={tts_voice}")
 
     # ── Sentence chunker — first sentence only for minimum perceived latency ──
     def before_tts_cb(agent_response: str) -> str:
@@ -806,13 +720,16 @@ async def entrypoint(ctx: JobContext):
         try:
             sb = db.get_supabase()
             if sb:
-                sb.table("active_calls").upsert({
-                    "room_id":     ctx.room.name,
-                    "phone":       caller_phone,
-                    "caller_name": caller_name,
-                    "status":      status,
-                    "last_updated": datetime.utcnow().isoformat(),
-                }).execute()
+                def _upsert():
+                    return sb.table("active_calls").upsert({
+                        "room_id":     ctx.room.name,
+                        "phone":       caller_phone,
+                        "caller_name": caller_name,
+                        "status":      status,
+                        "last_updated": datetime.utcnow().isoformat(),
+                    }).execute()
+                # Optimization: Supabase SDK is sync; offload write so call media loop is not blocked.
+                await asyncio.to_thread(_upsert)
         except Exception as e:
             logger.debug(f"[ACTIVE-CALL] {e}")
 
@@ -823,12 +740,15 @@ async def entrypoint(ctx: JobContext):
         try:
             sb = db.get_supabase()
             if sb:
-                sb.table("call_transcripts").insert({
-                    "call_room_id": ctx.room.name,
-                    "phone":        caller_phone,
-                    "role":         role,
-                    "content":      content,
-                }).execute()
+                def _insert():
+                    return sb.table("call_transcripts").insert({
+                        "call_room_id": ctx.room.name,
+                        "phone":        caller_phone,
+                        "role":         role,
+                        "content":      content,
+                    }).execute()
+                # Optimization: transcript persistence is best-effort and must not block turn handling.
+                await asyncio.to_thread(_insert)
         except Exception as e:
             logger.debug(f"[TRANSCRIPT-STREAM] {e}")
 
@@ -929,7 +849,9 @@ async def entrypoint(ctx: JobContext):
                 notes=intent["notes"],
             )
             if result.get("success"):
-                notify_booking_confirmed(
+                # Optimization: notification clients are synchronous; run them in a worker thread.
+                await asyncio.to_thread(
+                    notify_booking_confirmed,
                     caller_name=intent["caller_name"],
                     caller_phone=intent["caller_phone"],
                     booking_time_iso=intent["start_time"],
@@ -942,7 +864,9 @@ async def entrypoint(ctx: JobContext):
             else:
                 booking_status_msg = f"Booking Failed: {result.get('message')}"
         else:
-            notify_call_no_booking(
+            # Optimization: avoid blocking shutdown callback on Telegram/Twilio network I/O.
+            await asyncio.to_thread(
+                notify_call_no_booking,
                 caller_name=agent_tools.caller_name,
                 caller_phone=agent_tools.caller_phone,
                 call_summary="Caller did not schedule during this call.",
@@ -968,26 +892,15 @@ async def entrypoint(ctx: JobContext):
             logger.error(f"[SHUTDOWN] Transcript read failed: {e}")
             transcript_text = "unavailable"
 
-        # Sentiment analysis (#14) — use whichever LLM key is available
+        # Sentiment analysis (#14) — OpenAI only
         sentiment = "unknown"
-        if transcript_text and transcript_text != "unavailable":
-            _oai_key = (
-                os.environ.get("OPENAI_API_KEY", "") or
-                os.environ.get("GROQ_API_KEY", "")   # fallback: use Groq for sentiment too
-            )
-            if _oai_key:
+        if transcript_text and transcript_text != "unavailable" and _env("OPENAI_API_KEY"):
                 try:
                     import openai as _oai
-                    # Use Groq if no OpenAI key (cheaper + faster)
-                    if not os.environ.get("OPENAI_API_KEY") and os.environ.get("GROQ_API_KEY"):
-                        _client = _oai.AsyncOpenAI(
-                            api_key=os.environ["GROQ_API_KEY"],
-                            base_url="https://api.groq.com/openai/v1",
-                        )
-                        _sentiment_model = "llama-3.1-8b-instant"
-                    else:
-                        _client = _oai.AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
-                        _sentiment_model = "gpt-4o-mini"
+                    # Use the configured OpenAI analysis model for deterministic labels.
+                    # Optimization: reuse OpenAI env settings and avoid non-OpenAI fallback calls.
+                    _client = _oai.AsyncOpenAI(**_openai_kwargs())
+                    _sentiment_model = _env("OPENAI_ANALYSIS_MODEL", llm_model)
                     resp = await _client.chat.completions.create(
                         model=_sentiment_model, max_tokens=5, temperature=0.1,
                         messages=[{"role": "user", "content":
@@ -1094,7 +1007,9 @@ async def entrypoint(ctx: JobContext):
 
         # ── Save to Supabase ─────────────────────────────────────────────────
         from db import save_call_log
-        save_call_log(
+        # Optimization: final Supabase insert can retry/sleep; keep it off the async event loop.
+        await asyncio.to_thread(
+            save_call_log,
             phone=caller_phone,
             duration=duration,
             transcript=transcript_text,

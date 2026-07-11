@@ -9,6 +9,19 @@ logger = logging.getLogger("notify")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 TELEGRAM_URL       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+_requests_session = requests.Session()
+_async_client: httpx.AsyncClient | None = None
+
+
+def _get_async_client(timeout: float = 5.0) -> httpx.AsyncClient:
+    """Reuse webhook HTTP connections to reduce post-call notification latency."""
+    global _async_client
+    if _async_client is None or _async_client.is_closed:
+        _async_client = httpx.AsyncClient(
+            timeout=timeout,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+    return _async_client
 
 
 # ─── Telegram ──────────────────────────────────────────────────────────────────
@@ -19,7 +32,8 @@ def send_telegram(message: str) -> bool:
         logger.warning("[TELEGRAM] Token or Chat ID not set — skipping.")
         return False
     try:
-        resp = requests.post(
+        # Optimization: reuse TCP/TLS connections for repeated Telegram notifications.
+        resp = _requests_session.post(
             TELEGRAM_URL,
             json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"},
             timeout=5,
@@ -53,7 +67,8 @@ def send_whatsapp(to_phone: str, message: str) -> bool:
     to_wa = f"whatsapp:{to_phone}" if not to_phone.startswith("whatsapp:") else to_phone
 
     try:
-        resp = httpx.post(
+        # Optimization: reuse a sync session instead of creating a one-off client.
+        resp = _requests_session.post(
             f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json",
             auth=(account_sid, auth_token),
             data={"From": from_number, "To": to_wa, "Body": message},
