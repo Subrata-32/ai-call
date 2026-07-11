@@ -455,43 +455,17 @@ class OutboundAssistant(Agent):
         super().__init__(instructions=final_instructions, tools=tools)
 
     async def on_enter(self):
-        # IMPORTANT: Use generate_reply() instead of session.say() for the greeting.
-        # session.say() bypasses the LLM pipeline and leaves the speech scheduler
-        # in a paused state, which prevents the agent from responding to user input.
-        # generate_reply() goes through the proper LLM→TTS pipeline and keeps the
-        # session state clean so subsequent auto-replies work.
-        greeting = self._live_config.get(
-            "first_line",
-            self._first_line or (
-                "Hello, this is Aryan from RapidX AI. I help businesses with AI voice agents and automation. "
-                "What kind of business are you running?"
-            )
-        )
-        logger.info(f"[GREETING] Generating initial greeting via LLM pipeline")
-        await self.session.generate_reply(
-            instructions=f"Start the conversation by saying exactly this (do not add anything else): {greeting}"
-        )
+        # on_enter is intentionally empty.
+        # The greeting is handled AFTER session.start() in the entrypoint
+        # to avoid pipeline state corruption during startup.
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN ENTRYPOINT
 # ══════════════════════════════════════════════════════════════════════════════
 
-# NOTE: agent_is_speaking is no longer used to gate replies.
-# The AgentSession pipeline manages speech scheduling internally.
-agent_is_speaking = False
-
-
-def register_session_handlers(session, on_agent_speech_started, on_agent_speech_finished,
-                              on_agent_speech_interrupted, on_user_speech_committed):
-    session.on("agent_speech_started", on_agent_speech_started)
-    session.on("agent_speech_finished", on_agent_speech_finished)
-    session.on("agent_speech_interrupted", on_agent_speech_interrupted)
-    session.on("user_speech_committed", on_user_speech_committed)
-
-
 async def entrypoint(ctx: JobContext):
-    global agent_is_speaking
 
     # ── Connect ───────────────────────────────────────────────────────────
     await ctx.connect()
