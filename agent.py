@@ -131,6 +131,48 @@ def count_tokens(text: str) -> int:
         return len(text.split())
 
 
+def _trim_prompt_text(text: str, max_chars: int = 2200) -> str:
+    if not text:
+        return ""
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    cutoff = cleaned[:max_chars]
+    if " " in cutoff:
+        cutoff = cutoff.rsplit(" ", 1)[0]
+    return cutoff + " ..."
+
+
+def build_final_instructions(
+    base_instructions: str,
+    ist_context: str,
+    lang_instruction: str,
+    caller_history: str = "",
+    improvement_notes: str = "",
+) -> str:
+    parts = [
+        ANTI_HALLUCINATION_RULES,
+        _trim_prompt_text(base_instructions, 1800),
+        _trim_prompt_text(ist_context, 900),
+        _trim_prompt_text(lang_instruction, 500),
+    ]
+    if caller_history:
+        parts.append("[CALLER HISTORY] " + _trim_prompt_text(caller_history, 500))
+    if improvement_notes:
+        parts.append("[LESSONS LEARNED] " + _trim_prompt_text(improvement_notes, 500))
+
+    final_instructions = "\n\n".join(p for p in parts if p)
+    if count_tokens(final_instructions) > 700:
+        final_instructions = (
+            ANTI_HALLUCINATION_RULES
+            + "\n\n"
+            + _trim_prompt_text(base_instructions, 1100)
+            + "\n\n"
+            + _trim_prompt_text(lang_instruction, 300)
+        )
+    return final_instructions
+
+
 def prepare_tts_text(agent_response: str) -> str:
     """Return a compact TTS chunk while preserving the opening greeting."""
     text = (agent_response or "").strip()
@@ -398,12 +440,10 @@ class OutboundAssistant(Agent):
         lang_preset        = live_config_loaded.get("lang_preset", "multilingual")
         lang_instruction   = get_language_instruction(lang_preset)
 
-        # Anti-hallucination rules ALWAYS prepended — highest priority, cannot be overridden
-        final_instructions = (
-            ANTI_HALLUCINATION_RULES
-            + base_instructions
-            + ist_context
-            + lang_instruction
+        final_instructions = build_final_instructions(
+            base_instructions=base_instructions,
+            ist_context=ist_context,
+            lang_instruction=lang_instruction,
         )
 
         # Token counter (#11)

@@ -57,16 +57,18 @@ def build_supabase_storage_url(base_url: str, object_path: str) -> str:
 def get_supabase() -> Client | None:
     """Return a singleton Supabase client; re-create only if credentials changed."""
     global _supabase_client, _supabase_url, _supabase_key
-    url = os.environ.get("SUPABASE_URL", "")
+    raw_url = os.environ.get("SUPABASE_URL", "")
     key = os.environ.get("SUPABASE_KEY", "")
-    if not url or not key:
+    normalized_url = normalize_supabase_url(raw_url)
+    if not normalized_url or not key:
         return None
     # Re-create client only when credentials change (e.g. UI config override)
-    if _supabase_client and url == _supabase_url and key == _supabase_key:
+    if _supabase_client and normalized_url == _supabase_url and key == _supabase_key:
         return _supabase_client
     try:
-        _supabase_client = create_client(url, key)
-        _supabase_url    = url
+        os.environ["SUPABASE_URL"] = normalized_url
+        _supabase_client = create_client(normalized_url, key)
+        _supabase_url    = normalized_url
         _supabase_key    = key
         return _supabase_client
     except Exception as e:
