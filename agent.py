@@ -105,10 +105,9 @@ def get_live_config(phone_number: str | None = None):
         **config,
         "agent_instructions":       config.get("agent_instructions", ""),
         "stt_min_endpointing_delay":config.get("stt_min_endpointing_delay", 0.05),
-        # Optimization: force one OpenAI provider path so no stale config can add fallback latency.
-        "llm_provider":             "openai",
-        "stt_provider":             "openai",
-        "tts_provider":             "openai",
+        "llm_provider":             _env("LLM_PROVIDER", config.get("llm_provider") or "openai"),
+        "stt_provider":             _env("STT_PROVIDER", config.get("stt_provider") or "deepgram"),
+        "tts_provider":             _env("TTS_PROVIDER", config.get("tts_provider") or "deepgram"),
         "llm_model":                _env("OPENAI_MODEL", config.get("openai_model") or config.get("llm_model", "")),
         "llm_temperature":          float(config.get("llm_temperature", 0.3)),
         "max_completion_tokens":    int(config.get("max_completion_tokens", 80)),
@@ -546,7 +545,7 @@ async def entrypoint(ctx: JobContext):
     llm_temperature     = float(live_config.get("llm_temperature", 0.3))
     max_completion_toks = int(live_config.get("max_completion_tokens", 80))
 
-    # ── Auto-select best free provider based on available keys ────────────
+    # ── LLM remains OpenAI by design; speech providers can use Deepgram first. ───
     if llm_provider != "openai":
         logger.warning("[LLM] Ignoring non-OpenAI provider config: %s", llm_provider)
         llm_provider = "openai"
@@ -567,8 +566,9 @@ async def entrypoint(ctx: JobContext):
 
     # Build STT/TTS using Deepgram first when available; fall back to OpenAI otherwise.
     if stt_provider == "deepgram":
-        if not _env("DEEPGRAM_API_KEY"):
-            logger.warning("[STT] DEEPGRAM_API_KEY missing; falling back to OpenAI STT")
+        deepgram_key = _env("DEEPGRAM_API_KEY")
+        if not deepgram_key or deepgram_key == "your_deepgram_api_key_here":
+            logger.warning("[STT] DEEPGRAM_API_KEY missing or placeholder; falling back to OpenAI STT")
             stt_provider = "openai"
         else:
             from livekit.plugins import deepgram
@@ -577,7 +577,7 @@ async def entrypoint(ctx: JobContext):
                 model=stt_model,
                 language="" if stt_language in ("unknown", "auto", "") else stt_language,
                 detect_language=stt_language in ("unknown", "auto", ""),
-                api_key=_env("DEEPGRAM_API_KEY"),
+                api_key=deepgram_key,
             )
             logger.info(f"[STT] Deepgram | model={stt_model} | language={stt_language}")
 
@@ -595,8 +595,9 @@ async def entrypoint(ctx: JobContext):
         logger.info(f"[STT] OpenAI | model={stt_model} | realtime={_env('OPENAI_STT_REALTIME', 'true')}")
 
     if tts_provider == "deepgram":
-        if not _env("DEEPGRAM_API_KEY"):
-            logger.warning("[TTS] DEEPGRAM_API_KEY missing; falling back to OpenAI TTS")
+        deepgram_key = _env("DEEPGRAM_API_KEY")
+        if not deepgram_key or deepgram_key == "your_deepgram_api_key_here":
+            logger.warning("[TTS] DEEPGRAM_API_KEY missing or placeholder; falling back to OpenAI TTS")
             tts_provider = "openai"
         else:
             from livekit.plugins import deepgram
@@ -604,7 +605,7 @@ async def entrypoint(ctx: JobContext):
             agent_tts = deepgram.TTS(
                 model=tts_model,
                 voice=tts_voice or "aura-asteria-en",
-                api_key=_env("DEEPGRAM_API_KEY"),
+                api_key=deepgram_key,
             )
             logger.info(f"[TTS] Deepgram | model={tts_model} | voice={tts_voice or 'aura-asteria-en'}")
 
