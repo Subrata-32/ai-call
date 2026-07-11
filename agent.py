@@ -40,11 +40,11 @@ from livekit.agents import (
     Agent,
     AgentSession,
     JobContext,
+    RoomInputOptions,
     WorkerOptions,
     cli,
     llm,
 )
-from livekit.agents.room_io import RoomOptions, AudioInputOptions
 from livekit.plugins import openai
 import db  # singleton Supabase client — imported here so it's available everywhere
 from provider_config import resolve_speech_provider
@@ -427,19 +427,6 @@ class AgentTools(llm.ToolContext):
 # AGENT CLASS
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def speak_initial_greeting(session, greeting: str, logger_obj) -> None:
-    """Use the supported LiveKit speech API to start the call with a greeting."""
-    if not greeting:
-        return
-    try:
-        # allow_interruptions=True: if caller speaks during greeting, capture it.
-        # allow_interruptions=False would silently drop caller speech and cause
-        # the agent to go completely silent after the greeting.
-        await session.say(greeting, allow_interruptions=True)
-    except Exception as exc:
-        logger_obj.warning(f"[GREETING] Failed to send initial greeting: {exc}")
-
-
 class OutboundAssistant(Agent):
 
     def __init__(self, agent_tools: AgentTools, first_line: str = "", live_config: dict | None = None):
@@ -468,6 +455,11 @@ class OutboundAssistant(Agent):
         super().__init__(instructions=final_instructions, tools=tools)
 
     async def on_enter(self):
+        # IMPORTANT: Use generate_reply() instead of session.say() for the greeting.
+        # session.say() bypasses the LLM pipeline and leaves the speech scheduler
+        # in a paused state, which prevents the agent from responding to user input.
+        # generate_reply() goes through the proper LLM→TTS pipeline and keeps the
+        # session state clean so subsequent auto-replies work.
         greeting = self._live_config.get(
             "first_line",
             self._first_line or (
@@ -475,7 +467,10 @@ class OutboundAssistant(Agent):
                 "What kind of business are you running?"
             )
         )
-        await speak_initial_greeting(self.session, greeting, logger)
+        logger.info(f"[GREETING] Generating initial greeting via LLM pipeline")
+        await self.session.generate_reply(
+            instructions=f"Start the conversation by saying exactly this (do not add anything else): {greeting}"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -668,10 +663,9 @@ async def entrypoint(ctx: JobContext):
         stt_model = live_config.get("stt_model", "") or _env("OPENAI_TRANSCRIPTION_MODEL", "")
         if not stt_model:
             raise RuntimeError("OPENAI_TRANSCRIPTION_MODEL is required. Configure it in Railway Environment Variables.")
-        # use_realtime=False: the Realtime API has its own VAD that conflicts with
-        # turn_detection="stt" in AgentSession — this causes sessions where the STT
-        # never commits user speech. Standard streaming STT is more reliable for SIP.
-        _use_realtime = _env("OPENAI_STT_REALTIME", "false").lower() == "true"
+        # gpt-4o-mini-transcribe requires use_realtime=True (Realtime API).
+        # Setting it to false breaks STT entirely — no transcripts are produced.
+        _use_realtime = _env("OPENAI_STT_REALTIME", "true").lower() == "true"
         agent_stt = openai.STT(
             model=stt_model,
             language="" if stt_language in ("unknown", "auto", "") else stt_language,
@@ -735,17 +729,14 @@ async def entrypoint(ctx: JobContext):
         _noise_cancel = None
         logger.info("[AUDIO] BVC not available — running without noise cancellation")
 
-    # RoomOptions is the v1.x replacement for deprecated RoomInputOptions
+    # RoomInputOptions: deprecated but still works in this build
     if _noise_cancel:
         try:
-            room_input = RoomOptions(
-                close_on_disconnect=False,
-                audio_input=AudioInputOptions(noise_cancellation=_noise_cancel),
-            )
+            room_input = RoomInputOptions(close_on_disconnect=False, noise_cancellation=_noise_cancel)
         except Exception:
-            room_input = RoomOptions(close_on_disconnect=False)
+            room_input = RoomInputOptions(close_on_disconnect=False)
     else:
-        room_input = RoomOptions(close_on_disconnect=False)
+        room_input = RoomInputOptions(close_on_disconnect=False)
 
     session = AgentSession(
         stt=agent_stt,
@@ -813,7 +804,7 @@ async def entrypoint(ctx: JobContext):
     # NOTE: Handlers already registered above via @session.on(...) decorators.
     # register_session_handlers() call removed to prevent double-registration.
 
-    await session.start(room=ctx.room, agent=agent, room_options=room_input)
+    await session.start(room=ctx.room, agent=agent, room_input_options=room_input)
 
     # ── TTS pre-warm (#12) ────────────────────────────────────────────────
     try:
