@@ -466,8 +466,8 @@ async def entrypoint(ctx: JobContext):
     llm_provider  = live_config.get("llm_provider", "openai")
     tts_voice     = live_config.get("tts_voice", "kavya")
     tts_language  = live_config.get("tts_language", "hi-IN")
-    tts_provider  = resolve_speech_provider(live_config.get("tts_provider"), os.getenv("TTS_PROVIDER"), "deepgram")
-    stt_provider  = resolve_speech_provider(live_config.get("stt_provider"), os.getenv("STT_PROVIDER"), "deepgram")
+    tts_provider  = resolve_speech_provider(live_config.get("tts_provider"), os.getenv("TTS_PROVIDER"), "openai")
+    stt_provider  = resolve_speech_provider(live_config.get("stt_provider"), os.getenv("STT_PROVIDER"), "openai")
     stt_language  = live_config.get("stt_language", "unknown")  # auto-detect (#20)
     max_turns     = live_config.get("max_turns", 25)
 
@@ -564,22 +564,26 @@ async def entrypoint(ctx: JobContext):
     )
     logger.info(f"[LLM] OpenAI | model={llm_model} | temp={llm_temperature} | max_tokens={max_completion_toks}")
 
-    # Build STT/TTS using Deepgram first when available; fall back to OpenAI otherwise.
+    # Build STT/TTS using OpenAI by default. Deepgram remains available for later use if the runtime supports it.
     if stt_provider == "deepgram":
         deepgram_key = _env("DEEPGRAM_API_KEY")
         if not deepgram_key or deepgram_key == "your_deepgram_api_key_here":
-            logger.warning("[STT] DEEPGRAM_API_KEY missing or placeholder; falling back to OpenAI STT")
+            logger.warning("[STT] DEEPGRAM_API_KEY missing or placeholder; using OpenAI STT")
             stt_provider = "openai"
         else:
-            from livekit.plugins import deepgram
-            stt_model = live_config.get("stt_model", "nova-2")
-            agent_stt = deepgram.STT(
-                model=stt_model,
-                language="" if stt_language in ("unknown", "auto", "") else stt_language,
-                detect_language=stt_language in ("unknown", "auto", ""),
-                api_key=deepgram_key,
-            )
-            logger.info(f"[STT] Deepgram | model={stt_model} | language={stt_language}")
+            try:
+                from livekit.plugins import deepgram
+                stt_model = live_config.get("stt_model", "nova-2")
+                agent_stt = deepgram.STT(
+                    model=stt_model,
+                    language="" if stt_language in ("unknown", "auto", "") else stt_language,
+                    detect_language=stt_language in ("unknown", "auto", ""),
+                    api_key=deepgram_key,
+                )
+                logger.info(f"[STT] Deepgram | model={stt_model} | language={stt_language}")
+            except Exception as exc:
+                logger.warning(f"[STT] Deepgram unavailable: {exc}. Falling back to OpenAI STT")
+                stt_provider = "openai"
 
     if stt_provider == "openai":
         stt_model = live_config.get("stt_model", "") or _env("OPENAI_TRANSCRIPTION_MODEL", "")
@@ -597,17 +601,21 @@ async def entrypoint(ctx: JobContext):
     if tts_provider == "deepgram":
         deepgram_key = _env("DEEPGRAM_API_KEY")
         if not deepgram_key or deepgram_key == "your_deepgram_api_key_here":
-            logger.warning("[TTS] DEEPGRAM_API_KEY missing or placeholder; falling back to OpenAI TTS")
+            logger.warning("[TTS] DEEPGRAM_API_KEY missing or placeholder; using OpenAI TTS")
             tts_provider = "openai"
         else:
-            from livekit.plugins import deepgram
-            tts_model = live_config.get("tts_model", "aura-asteria-en")
-            agent_tts = deepgram.TTS(
-                model=tts_model,
-                voice=tts_voice or "aura-asteria-en",
-                api_key=deepgram_key,
-            )
-            logger.info(f"[TTS] Deepgram | model={tts_model} | voice={tts_voice or 'aura-asteria-en'}")
+            try:
+                from livekit.plugins import deepgram
+                tts_model = live_config.get("tts_model", "aura-asteria-en")
+                agent_tts = deepgram.TTS(
+                    model=tts_model,
+                    voice=tts_voice or "aura-asteria-en",
+                    api_key=deepgram_key,
+                )
+                logger.info(f"[TTS] Deepgram | model={tts_model} | voice={tts_voice or 'aura-asteria-en'}")
+            except Exception as exc:
+                logger.warning(f"[TTS] Deepgram unavailable: {exc}. Falling back to OpenAI TTS")
+                tts_provider = "openai"
 
     if tts_provider == "openai":
         tts_model = live_config.get("tts_model", "") or _env("OPENAI_TTS_MODEL", "")
